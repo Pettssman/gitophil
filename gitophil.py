@@ -2,6 +2,8 @@
 
 import subprocess
 import os
+import uuid
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from prompt_toolkit import prompt as pt_prompt
@@ -13,6 +15,7 @@ import sys
 import threading
 import tomllib
 import tomli_w
+import prompts
 
 DEBUG = False
 CONFIG_PATH = Path(sys.executable).parent / "gitophil_config.toml" if getattr(sys, 'frozen', False) else Path(__file__).parent / "gitophil_config.toml"
@@ -53,6 +56,11 @@ AVAILABLE_GIT_OPERATIONS = {
 }
 
 
+class AbortWorkflow(Exception):
+    """Raised to abort the current workflow and return to menu."""
+    pass
+
+
 def load_workflows(config):
     """Convert [[workflow]] array-of-tables into an ordered dict keyed by name."""
     raw = config.get("workflow")
@@ -84,8 +92,29 @@ def run(command, capture_output=False, shell=False, input=None):
     result = subprocess.run(command, shell=shell, text=True, capture_output=capture_output, input=input, encoding="utf-8")
     if result.returncode > 1:  # git diff returns 1 when there are changes, which is fine
         print(f"Command failed: {command}")
-        os._exit(1)
+        raise AbortWorkflow(f"Command failed: {command}")
     return result.stdout.strip() if capture_output else None
+
+
+def run_copilot(prompt_text):
+    """Run a one-off Copilot CLI generation without leaving a resumable session.
+
+    Assigns a known session id so the on-disk session state can be deleted
+    afterwards, keeping these throwaway prompts out of `/resume`. Uses the
+    'auto' model and silent output for clean scripting.
+    """
+    session_id = str(uuid.uuid4())
+    try:
+        result = run(
+            ["copilot", "--session-id", session_id, "-s", "--model", "auto"],
+            input=prompt_text,
+            capture_output=True,
+            shell=True,
+        )
+    finally:
+        session_dir = Path.home() / ".copilot" / "session-state" / session_id
+        shutil.rmtree(session_dir, ignore_errors=True)
+    return result
 
 
 def send_pr_notification(notification_text):
@@ -151,12 +180,17 @@ def get_diff(only_staged=False):
         full_diff = run(["git", "diff", "--cached", "--unified=0"], capture_output=True)
     else:
         full_diff = run(["git", "diff", "--unified=0"], capture_output=True)
-    if not full_diff:
-        return ""
-    diff = "\n".join(
-        l for l in full_diff.splitlines()
-        if l.startswith(("diff --git", "@@", "+", "-"))
-    )
+    diff = ""
+    if full_diff:
+        diff = "\n".join(
+            l for l in full_diff.splitlines()
+            if l.startswith(("diff --git", "@@", "+", "-"))
+        )
+
+    untracked = run(["git", "ls-files", "--others", "--exclude-standard"], capture_output=True)
+    if untracked:
+        diff += f"\nuntracked: {', '.join(untracked.splitlines())}"
+
     return diff
 
 # ─── AI generation ───────────────────────────────────────────────────
@@ -165,24 +199,8 @@ def generate_branchname(only_staged=False):
     diff = get_diff(only_staged=only_staged)
     if not diff:
         return ""
-    prompt_text = f"""Role: Git branch name generator.
-
-Rules:
-- Format: <company>/<feature> or just <feature> if no company is identifiable
-- Extract company from file paths or namespaces in the diff (e.g. bestdk, nordicfeel, postnord)
-- Feature part: kebab-case, lowercase, 2-4 words max
-- No prefixes like "feature/" — only company/ or bare name
-- Examples: bestdk/scanning-changes, nordicfeel/supplier-mail, disable-send-button
-
-Diff:
-{diff}
-
-Output: branch name only, nothing else."""
-    result = run(
-        ["copilot"], input=prompt_text,
-        capture_output=True,
-        shell=True
-    )
+    prompt_text = prompts.branch_name(diff)
+    result = run_copilot(prompt_text)
     return result
 
 
@@ -190,24 +208,17 @@ def generate_commitmessage(only_staged=False):
     diff = get_diff(only_staged=only_staged)
     if not diff:
         return ""
-    prompt_text = f"""Role: Git commit message generator.
-
-Rules:
-- Max 50 characters
-- Imperative mood, present tense (e.g. "Add", "Fix", "Remove" — not "Added", "Fixes")
-- No trailing period
-- Capitalize first word
-- Describe *what* the change does, not *why*
-
-Diff:
-{diff}
-
-Output: commit message only, nothing else."""
-    result = run(
-        ["copilot"], input=prompt_text,
-        capture_output=True,
-        shell=True
-    )
+    
+    # Get previous commits on this branch (if not on main)
+    current_branch = run(["git", "branch", "--show-current"], capture_output=True)
+    previous_commits = ""
+    if current_branch and current_branch != "main":
+        commits = run(["git", "log", "origin/main..HEAD", "--pretty=format:%s", "--no-merges"], capture_output=True)
+        if commits:
+            previous_commits = f"\nPrevious commits on this branch:\n{commits}\n"
+    
+    prompt_text = prompts.commit_message(diff, previous_commits)
+    result = run_copilot(prompt_text)
     return result
 
 
@@ -218,24 +229,15 @@ def generate_pr_title():
     diff = "\n".join(l for l in full_diff.splitlines() if l.startswith(("+", "-")))
     if not diff:
         return ""
-    prompt_text = f"""Role: GitHub pull request title generator.
-
-Rules:
-- Max 50 characters
-- Imperative mood, present tense (e.g. "Add", "Fix", "Remove" — not "Added", "Fixes")
-- No trailing period
-- Capitalize first word
-- Summarize the overall intent of all changes, not individual lines
-
-Diff:
-{diff}
-
-Output: PR title only, nothing else."""
-    result = run(
-        ["copilot"], input=prompt_text,
-        capture_output=True,
-        shell=True
-    )
+    
+    # Get all commits on this branch
+    commits = run(["git", "log", "origin/main..HEAD", "--pretty=format:%s", "--no-merges"], capture_output=True)
+    commits_context = ""
+    if commits:
+        commits_context = f"\nCommits on this branch:\n{commits}\n"
+    
+    prompt_text = prompts.pr_title(diff, commits_context)
+    result = run_copilot(prompt_text)
     return result
 
 # ─── Individual step functions ───────────────────────────────────────
@@ -269,11 +271,7 @@ def step_create_branch(branchname_future, use_ai):
     """Create and switch to a new branch from main."""
     current_branch = run(["git", "branch", "--show-current"], capture_output=True)
     if current_branch != "main":
-        try:
-            run(["git", "switch", "main"], capture_output=True)
-        except SystemExit:
-            print("Create branch was in workflow but could not switch to main")
-            os._exit(1)
+        run(["git", "switch", "main"], capture_output=True)
 
     if use_ai:
         branchname_cp = wait_with_loading(branchname_future, "Loading AI branch name suggestion")
@@ -289,12 +287,10 @@ def step_create_branch(branchname_future, use_ai):
 def step_commit(commitmsg_future, use_ai, only_staged=False):
     """Stage and commit. commit_mode='all' stages everything; 'staged' commits only what's already staged."""
     if only_staged and subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True).returncode == 0:
-        print("No staged changes, aborting.")
-        os._exit(0)
+        raise AbortWorkflow("No staged changes.")
 
     if not only_staged and subprocess.run(["git", "diff", "--quiet"], capture_output=True).returncode == 0:
-        print("No changes to commit, but 'commit' step was selected. Aborting.")
-        os._exit(0)
+        raise AbortWorkflow("No changes to commit.")
     
     run(["git", "status", "--short"], shell=False)
     if use_ai:
@@ -304,8 +300,7 @@ def step_commit(commitmsg_future, use_ai, only_staged=False):
     commitmsg = prompt("Enter commit message: ", default=commitmsg)
 
     if not commitmsg:
-        print("Empty commit message, aborting.")
-        os._exit(0)
+        raise AbortWorkflow("Empty commit message.")
 
     if not only_staged:
         run(["git", "add", "."])
@@ -317,11 +312,7 @@ def step_commit(commitmsg_future, use_ai, only_staged=False):
 def step_rebase():
     """Fetch and rebase on origin/main."""
     run(["git", "fetch"])
-    try:
-        run(["git", "rebase", "origin/main"])
-    except SystemExit:
-        print("Failed to rebase")
-        os._exit(1)
+    run(["git", "rebase", "origin/main"])
 
 
 def step_push():
@@ -344,8 +335,7 @@ def step_create_pr(pr_title_future, draft=False, use_ai=False):
 
     template_path = Path("./pull_request_template.md")
     if not template_path.exists():
-        print("PR template not found.")
-        os._exit(1)
+        raise AbortWorkflow("PR template not found.")
 
     pr_template = template_path.read_text(encoding="utf-8-sig")
     pr_body = f"{prdesc}\n\n{pr_template}"
@@ -380,8 +370,34 @@ def step_switch_to_main():
     run(["git", "switch", "main"])
 
 
+def background_cleanup_branches():
+    """Silently prune and delete gone branches in the background at startup.
+
+    Runs without any prompts (cleanup has been deemed safe) and swallows all
+    errors so it can never interfere with or crash the interactive app.
+    """
+    try:
+        git_dir = Path(run(["git", "rev-parse", "--git-dir"], capture_output=True))
+        for lock in git_dir.glob("refs/remotes/**/*.lock"):
+            lock.unlink()
+        run(["git", "fetch", "--prune"], capture_output=True)
+        result = run(["git", "branch", "-vv"], capture_output=True)
+        for line in result.splitlines():
+            if "gone]" in line:
+                branch_name = line.split()[0]
+                run(["git", "branch", "-D", branch_name], capture_output=True)
+    except Exception:
+        pass
+
+
 def step_cleanup_branches():
     """Prune remote-tracking branches that no longer exist on the remote."""
+    git_dir = Path(run(["git", "rev-parse", "--git-dir"], capture_output=True))
+    lock_files = list(git_dir.glob("refs/remotes/**/*.lock"))
+    if lock_files:
+        print(f"Removing {len(lock_files)} stale .lock file(s)...")
+        for lock in lock_files:
+            lock.unlink()
     run(["git", "fetch", "--prune"], capture_output=True)
     # Get branches that are gone
     result = run(["git", "branch", "-vv"], capture_output=True)
@@ -411,20 +427,24 @@ def step_cleanup_branches():
 
 # ─── Menu & orchestration ───────────────────────────────────────────
 
+EXIT_CHOICE = "Exit"
+
 def choose_workflow():
-    """Present the main menu and return the workflow dict + name."""
+    """Present the main menu and return the workflow dict + name, or None to exit."""
     current_branch = run(["git", "branch", "--show-current"], capture_output=True)
     _workflows = load_workflows(CONFIG)
     if current_branch != "main":
         _workflows = {k: v for k, v in _workflows.items() if "branch" not in v["steps"]}
+
+    choices = list(_workflows) + [EXIT_CHOICE]
     name = questionary.select(
         "What would you like to do?",
-        choices=list(_workflows),
+        choices=choices,
         instruction="(arrow keys to move, enter to select)",
     ).ask()
 
-    if name is None:  # Ctrl-C
-        os._exit(0)
+    if name is None or name == EXIT_CHOICE:
+        return None, None
 
     wf = _workflows[name]
 
@@ -438,11 +458,9 @@ def choose_workflow():
             instruction="(space to toggle, enter to confirm)",
         ).ask()
         if selected is None:
-            os._exit(0)
+            return None, None
         wf["steps"] = selected
         return wf, name
-
-    
 
     return wf, name
 
@@ -458,10 +476,12 @@ def init_config():
         name = prompt("Enter your name (for branch name and PR notifications): ")
         webhook_url = prompt("Enter your Power Automate webhook URL (for PR notifications): ")
         only_staged = questionary.confirm("Only commit staged changes?").ask()
+        cleanup_at_startup = questionary.confirm("Clean up gone branches in the background at startup?").ask()
         default_config = {
             "Name": name,
             "Webhook_URL": webhook_url,
             "Only_commit_staged": only_staged,
+            "Cleanup_at_startup": cleanup_at_startup,
             "workflow": DEFAULT_WORKFLOWS,
         }
         with open(CONFIG_PATH, "wb") as f:
@@ -478,76 +498,104 @@ def init_config():
         global CONFIG
         CONFIG = tomllib.load(f)
 
-def main():
-    init_config()
 
+def run_workflow(wf_dict):
+    """Execute a single workflow. Raises AbortWorkflow to return to menu."""
     only_staged = CONFIG.get("Only_commit_staged", False)
-    # Kick off AI suggestions in background for any steps that need them
-    executor = ThreadPoolExecutor(max_workers=3)
-    branchname_future = executor.submit(generate_branchname, only_staged)
-    commitmsg_future = executor.submit(generate_commitmessage, only_staged)
+    steps = wf_dict["steps"]
+    use_ai = wf_dict.get("ai")
 
-    wf, wf_name = choose_workflow()
-    steps = wf["steps"]
-    use_ai = wf.get("ai")
     print(f"\nSteps: {', '.join(AVAILABLE_GIT_OPERATIONS[s] for s in steps)}\n")
 
-    if not use_ai:
-        branchname_future.cancel()
-        commitmsg_future.cancel()
+    executor = ThreadPoolExecutor(max_workers=3)
+
+    # Only start AI queries now that a workflow has been selected
+    if use_ai:
+        branchname_future = executor.submit(generate_branchname, only_staged) if "branch" in steps else None
+        commitmsg_future = executor.submit(generate_commitmessage, only_staged) if "commit" in steps else None
+    else:
         branchname_future = executor.submit(lambda: "")
         commitmsg_future = executor.submit(lambda: "")
 
-    if "stash" in steps:
-        step_stash()
-        branchname_future = executor.submit(generate_branchname, only_staged)
-        commitmsg_future = executor.submit(generate_commitmessage, only_staged)
+    try:
+        if "stash" in steps:
+            step_stash()
+            # Re-generate AI suggestions after stash since diff changed
+            if use_ai:
+                if "branch" in steps:
+                    branchname_future = executor.submit(generate_branchname, only_staged)
+                if "commit" in steps:
+                    commitmsg_future = executor.submit(generate_commitmessage, only_staged)
 
-    if "branch" in steps:
-        step_create_branch(branchname_future, use_ai)
+        if "branch" in steps:
+            step_create_branch(branchname_future, use_ai)
 
-    if "commit" in steps:
-        commitmsg = step_commit(commitmsg_future, use_ai, only_staged)
-    elif run(["git", "branch", "--show-current"], capture_output=True) != "main":
-        commitmsg = run(["git", "log", "-1", "--pretty=%s"], capture_output=True)
-    else:
-        commitmsg = ""
+        if "commit" in steps:
+            commitmsg = step_commit(commitmsg_future, use_ai, only_staged)
+        elif run(["git", "branch", "--show-current"], capture_output=True) != "main":
+            commitmsg = run(["git", "log", "-1", "--pretty=%s"], capture_output=True)
+        else:
+            commitmsg = ""
 
-    if num_commits() > 1 and use_ai:
-        pr_title_future = executor.submit(generate_pr_title)
-    else:
-        pr_title_future = executor.submit(lambda: commitmsg)
+        if "create pr" in steps or "create draft pr" in steps:
+            if num_commits() > 1 and use_ai:
+                pr_title_future = executor.submit(generate_pr_title)
+            else:
+                pr_title_future = executor.submit(lambda: commitmsg)
+        else:
+            pr_title_future = None
 
-    if "rebase" in steps:
-        step_rebase()
+        if "rebase" in steps:
+            step_rebase()
 
-    if "push" in steps:
-        step_push()
+        if "push" in steps:
+            step_push()
 
-    if "create pr" in steps:
-        draft = "create draft pr" in steps
-        pr_link = step_create_pr(pr_title_future, draft=draft, use_ai=use_ai)
-        if not draft and "send webhook" in steps:
-            send_pr_notification(pr_link)
+        if "create pr" in steps or "create draft pr" in steps:
+            draft = "create draft pr" in steps
+            pr_link = step_create_pr(pr_title_future, draft=draft, use_ai=use_ai)
+            if not draft and "send webhook" in steps:
+                send_pr_notification(pr_link)
 
-    if "automerge" in steps:
-        step_automerge()
-    
-    if "switch to main" in steps:
-        step_switch_to_main()
+        if "automerge" in steps:
+            step_automerge()
 
-    if "cleanup_branches" in steps:
-        step_cleanup_branches()
-    
-    if "stash" in steps:
-        run(["git", "stash", "pop"], shell=False)
+        if "switch to main" in steps:
+            step_switch_to_main()
 
-    print("\nDone!")
-    executor.shutdown(wait=False)
-    os._exit(0)
+        if "cleanup_branches" in steps:
+            step_cleanup_branches()
+
+        if "stash" in steps:
+            run(["git", "stash", "pop"], shell=False)
+
+        print("\nDone!")
+    finally:
+        executor.shutdown(wait=False)
+
+
+def main():
+    init_config()
+
+    if CONFIG.get("Cleanup_at_startup", False):
+        threading.Thread(target=background_cleanup_branches, daemon=True).start()
+
+    while True:
+        print()
+        wf_dict, wf_name = choose_workflow()
+        if wf_dict is None:
+            print("Bye!")
+            break
+
+        try:
+            run_workflow(wf_dict)
+        except AbortWorkflow as e:
+            print(f"\nAborted: {e}")
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        os._exit(1)
+        print("\nBye!")
+        os._exit(0)
